@@ -41,9 +41,21 @@ def _parse_page(html: str) -> tuple[list[dict[str, Any]], int | None]:
     return parent["inventories"], parent.get("count")
 
 
+def _split_category(path: str | None) -> tuple[str | None, str | None]:
+    """Split Barbora's category path into (readable_path, short_id).
+    'c/TJC6/mesa-zuvis-ir-kulinarija/sviezia-mesa-ir-paukstiena'
+        -> ('mesa-zuvis-ir-kulinarija/sviezia-mesa-ir-paukstiena', 'TJC6')
+    A path without the 'c/<id>/' prefix is returned unchanged, with id None."""
+    parts = [s for s in (path or "").split("/") if s]
+    if len(parts) >= 2 and parts[0] == "c":
+        return "/".join(parts[2:]) or None, parts[1]
+    return "/".join(parts) or None, None
+
+
 def _normalize(p: dict[str, Any]) -> dict[str, Any]:
     promo = p.get("promotion")
     cu = p.get("comparativeUnit") or {}
+    category, category_id = _split_category(p.get("categoryPathUrl"))
     return {
         "store": "barbora",
         "id": p["id"],
@@ -57,24 +69,46 @@ def _normalize(p: dict[str, Any]) -> dict[str, Any]:
 
         "unit_price": cu.get("price"),
         "unit": cu.get("type"),
-        "category": p.get("categoryPathUrl"),
+        "category": category,
+        "category_id": category_id or p.get("categoryShortId"),
         "image": p.get("image"),
         "url": f"{BASE}/produktai/" + p["url"],
     }
 
 
 def scrape(category_path: str, max_pages: int = 3) -> list[dict[str, Any]]:
-    """category_path example:
+    """Never raises: on any error it prints the reason and returns the rows
+    collected so far (possibly an empty list).
+    category_path example:
     'c/LVOK/mesa-zuvis-ir-kulinarija/sviezia-mesa-ir-paukstiena'"""
-    rows, seen = [], set()
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
     for page in range(1, max_pages + 1):
-        html = get_html(f"{BASE}/{category_path}", params={"page": page})
-        raw, total = _parse_page(html)
-        items = [_normalize(p) for p in raw]
+        # 1) download and parse the page
+        try:
+            html = get_html(f"{BASE}/{category_path}", params={"page": page})
+            raw, total = _parse_page(html)
+        except Exception as e:
+            print(f"barbora page {page} FAILED: {e!r} -> stopping, keeping {len(rows)} rows")
+            break
+
+        # 2) normalize each product; one bad record is skipped, not fatal
+        items = []
+        for p in raw:
+            try:
+                items.append(_normalize(p))
+            except Exception as e:
+                print(f"barbora page {page}: skipped a product ({e!r})")
+
         new = [r for r in items if r["id"] not in seen]
         print(f"barbora page {page}: {len(items)} products, {len(new)} new (category total: {total})")
         if not new:      # empty page, or the site ignored ?page= and repeated page 1
             break
         seen.update(r["id"] for r in new)
         rows += new
+
+        if total and len(seen) >= total:   # got everything, don't request a page past the end
+            break
+
     return rows
